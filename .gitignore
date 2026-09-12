@@ -1,0 +1,7 @@
+# 构建/依赖产物（不入库）
+.deps/
+.build/
+dist/
+__pycache__/
+*.spec
+*.pyc
