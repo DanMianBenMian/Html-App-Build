@@ -1,11 +1,14 @@
 # TWNativePack · TurboWarp 一键转原生 App
 
-把 TurboWarp 导出的**单文件 HTML** 一键打包成 **iOS 可侧载 IPA** 或 **Android 可装 APK**。
-无需 Mac、无需 Android SDK——云端 GitHub Actions 出包，本地只需选文件、填名、点构建。
+把 TurboWarp 导出的**单文件 HTML** 或**整个网页文件夹** 一键打包成 **iOS 可侧载 IPA** 或 **Android 可装 APK**。
+无需 Mac、无需 Android SDK——云端 GitHub Actions 出包，本地只需选文件/文件夹、填名、点构建。
 
 ## 功能
 - 选平台（iOS / Android）
-- 选图标图片 + 应用名称 + TurboWarp 打包后的 `.html`
+- **两种来源二选一**：
+  - **单文件**：选 TurboWarp 打包后的 `.html`（原模式）
+  - **文件夹**：选整个网页文件夹（如从桌面版 TurboWarp 提取的离线编辑器），自动探测入口 `index.html`，也可手动填入口（如 `gui/gui.html`）；文件夹会被打成 `app.zip` 推到云端再解压，子资源（js / woff2 / svg 等）按相对路径保留
+- 选图标图片 + 应用名称
 - 勾选需要的权限（相机 / 麦克风 / 照片库 / 蓝牙 / 定位）→ 自动写进 Info.plist / AndroidManifest，降低桥接复杂度
 - iOS 分支：填 GitHub PAT（可勾「记住」存本机）→ 建临时仓库并推送 → 触发 macos runner 构建 → 拉日志 → 下载 IPA → （默认）自动删库
 - Android 分支：同样走云端 ubuntu+Android SDK runner 出 APK（代码已留本地 Gradle 接口，装了 SDK 可切真·本地）
