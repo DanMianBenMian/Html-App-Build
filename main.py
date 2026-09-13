@@ -43,9 +43,18 @@ C_TEXT = "#c9d1d9"
 C_PANEL = "rgba(20,28,46,0.72)"
 
 
+class AskHandle:
+    """工作线程 -> 主线程弹窗询问的回复容器（用 Event 同步两个线程）。"""
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = False
+
+
 class LogEmitter(QObject):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int, str)
+    # (标题, 正文, AskHandle)：工作线程请求用户决定是否继续等待
+    ask = pyqtSignal(str, str, object)
 
 
 class Worker(threading.Thread):
@@ -54,11 +63,19 @@ class Worker(threading.Thread):
         self.emitter = emitter
         self.kwargs = kwargs
 
+    def _ask(self, title, message):
+        """构建线程里调用：弹窗阻塞等待用户点按钮，返回 True=继续等待。"""
+        handle = AskHandle()
+        self.emitter.ask.emit(title, message, handle)
+        handle.event.wait()      # 等主线程弹窗完成
+        return handle.result
+
     def run(self):
         try:
             product = build_core.build(
                 log=self.emitter.log.emit,
                 progress=self.emitter.progress.emit,
+                ask=self._ask,
                 **self.kwargs)
             if product:
                 self.emitter.log.emit("✅ 构建完成，产物: %s" % product)
@@ -377,6 +394,7 @@ class MainWindow(QWidget):
         self.emitter = LogEmitter()
         self.emitter.log.connect(self._on_log)
         self.emitter.progress.connect(self._on_progress)
+        self.emitter.ask.connect(self._on_ask)
         self._init_ui()
         self._load_saved()
         # 上拉弹窗（构建时才显示）
@@ -454,20 +472,35 @@ class MainWindow(QWidget):
         h.addWidget(self.bundle, 3)
         root.addLayout(h)
 
-        # 图标 + html
+        # 图标 + 来源（单 HTML 或 文件夹）
         h = QHBoxLayout()
         self.icon_btn = GhostButton("选择图标图片")
         self.icon_btn.clicked.connect(self._pick_icon)
         self.icon_label = QLabel("未选择")
         self.icon_label.setStyleSheet("QLabel{color:#7d8ba5;}")
-        self.html_btn = GhostButton("选择 .html (TW 打包产物)")
+        self.html_btn = GhostButton("选择 .html (单文件)")
         self.html_btn.clicked.connect(self._pick_html)
         self.html_label = QLabel("未选择")
         self.html_label.setStyleSheet("QLabel{color:#7d8ba5;}")
+        self.folder_btn = GhostButton("选择文件夹")
+        self.folder_btn.clicked.connect(self._pick_folder)
+        self.folder_label = QLabel("未选择")
+        self.folder_label.setStyleSheet("QLabel{color:#7d8ba5;}")
         h.addWidget(self.icon_btn)
         h.addWidget(self.icon_label)
         h.addWidget(self.html_btn)
         h.addWidget(self.html_label)
+        h.addWidget(self.folder_btn)
+        h.addWidget(self.folder_label)
+        root.addLayout(h)
+
+        # 入口文件（仅文件夹模式需要）
+        h = QHBoxLayout()
+        h.addWidget(self._field_label("入口文件:"))
+        self.entry = QLineEdit()
+        self.entry.setPlaceholderText("文件夹模式加载的首页，留空默认 index.html（如 gui/gui.html）")
+        self.entry.setStyleSheet(self._edit_style())
+        h.addWidget(self.entry, 1)
         root.addLayout(h)
 
         # 权限（按平台动态展示：仅列出该平台可申请项）
@@ -659,12 +692,38 @@ class MainWindow(QWidget):
         if p:
             self.html_path = p
             self.html_label.setText(os.path.basename(p))
+            # 单文件模式：清空文件夹选择
+            self.folder_path = ""
+            self.folder_label.setText("未选择")
 
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(self, "产物目录")
         if d:
             self.out_dir = d
             self.out_label.setText(d)
+
+    def _pick_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "选择网页文件夹")
+        if d:
+            self.folder_path = d
+            self.folder_label.setText(d)
+            # 文件夹模式：清空单文件选择
+            self.html_path = ""
+            self.html_label.setText("未选择")
+            # 自动探测入口：优先 index.html，否则第一个 .html
+            cand = os.path.join(d, "index.html")
+            if os.path.isfile(cand):
+                self.entry.setText("index.html")
+            else:
+                found = None
+                for r, _, fs in os.walk(d):
+                    for f in fs:
+                        if f.endswith(".html"):
+                            found = os.path.relpath(os.path.join(r, f), d).replace(os.sep, "/")
+                            break
+                    if found:
+                        break
+                self.entry.setText(found or "index.html")
 
     def _on_remember(self, state):
         if state:
@@ -686,19 +745,52 @@ class MainWindow(QWidget):
         elif name in ("失败", "未产出"):
             self.sheet.show_result(False, "❌ 构建失败 · 可关闭")
 
+    def _on_ask(self, title, message, handle):
+        """构建线程遇到网络异常/等待超时时的询问弹窗（在主线程执行）。"""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.setStyleSheet(
+            "QMessageBox{background:#0d1117;}"
+            "QLabel{color:#c9d1d9;font-size:13px;}"
+            "QPushButton{background:#161b22;color:#c9d1d9;border:1px solid #30363d;"
+            "border-radius:6px;padding:7px 18px;min-width:110px;}"
+            "QPushButton:hover{background:#1f2634;border-color:#58a6ff;}"
+            "QPushButton:default{border-color:#58a6ff;color:#58a6ff;}")
+        btn_continue = box.addButton("继续等待", QMessageBox.ButtonRole.AcceptRole)
+        btn_stop = box.addButton("放弃这次构建", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_continue)
+        box.exec()
+        handle.result = (box.clickedButton() is btn_continue)
+        handle.event.set()
+
     def _build(self):
         platform = self.platform.currentText().lower()
         name = self.name.text().strip()
         html_path = getattr(self, "html_path", "")
+        folder_path = getattr(self, "folder_path", "")
         icon_path = getattr(self, "icon_path", "")
         perms = [k for k, cb in self.perm_boxes.items() if cb.isChecked()]
         token = self.pat.text().strip()
         if not name:
             QMessageBox.warning(self, "缺信息", "请填写应用名称")
             return
-        if not html_path or not os.path.isfile(html_path):
-            QMessageBox.warning(self, "缺信息", "请选择 TurboWarp 打包后的 .html 文件")
-            return
+        if folder_path:
+            if not os.path.isdir(folder_path):
+                QMessageBox.warning(self, "缺信息", "请选择网页文件夹")
+                return
+            entry_html = self.entry.text().strip() or "index.html"
+            if not os.path.isfile(os.path.join(folder_path, entry_html)):
+                QMessageBox.warning(self, "缺信息",
+                                    "文件夹内找不到入口文件：%s" % entry_html)
+                return
+        else:
+            if not html_path or not os.path.isfile(html_path):
+                QMessageBox.warning(self, "缺信息",
+                                    "请选择 .html 文件 或 一个网页文件夹")
+                return
+            entry_html = None
         if not token:
             QMessageBox.warning(self, "缺信息", "请填写 GitHub PAT（可勾记住）")
             return
@@ -708,6 +800,7 @@ class MainWindow(QWidget):
         self.sheet.open_sheet()
         self._on_log("=== 开始构建 %s: %s ===" % (platform.upper(), name))
         w = Worker(self.emitter, platform=platform, html_path=html_path,
+                   folder_path=folder_path, entry_html=entry_html,
                    icon_path=icon_path, name=name,
                    bundle_id=self.bundle.text().strip(),
                    perms=perms, token=token,
