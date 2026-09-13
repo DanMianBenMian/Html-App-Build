@@ -113,7 +113,7 @@ jobs:
 """
 
 # iOS 工程的生成脚本（被工作流调用，读取 config.json + app.html + icon.png）
-IOS_MAKER = r"""import json, os, subprocess, shutil
+IOS_MAKER = r"""import json, os, subprocess, shutil, io, re
 
 cfg = json.load(open('config.json'))
 APP_NAME = cfg.get('name', 'TWPackApp')
@@ -138,6 +138,27 @@ else:
         raise SystemExit('ERROR: 仓库里找不到 app.html，无法打包')
     _web_entry = 'app.html'
     print('单文件模式：app.html')
+
+# ---- 注入原生桥接 polyfill（让保存/打开/新窗口/插件在 WKWebView 可用）----
+try:
+    _bridge_path = 'tw_bridge.js'
+    if os.path.exists(_bridge_path) and os.path.exists(_web_entry):
+        _bjs = io.open(_bridge_path, encoding='utf-8').read()
+        _html = io.open(_web_entry, encoding='utf-8', errors='replace').read()
+        if 'tw_bridge_v1' not in _html:
+            _m = re.search(r'<head[^>]*>', _html, re.IGNORECASE)
+            if _m:
+                _html = _html[:_m.end()] + '\n' + _bjs + _html[_m.end():]
+                io.open(_web_entry, 'w', encoding='utf-8').write(_html)
+                print('已注入 tw_bridge 到', _web_entry)
+            else:
+                print('WARNING: 入口 HTML 无 <head>，未注入 bridge')
+        else:
+            print('bridge 已存在，跳过注入')
+    else:
+        print('WARNING: 缺少 tw_bridge.js 或入口 HTML，未注入 bridge')
+except Exception as _e:
+    print('bridge 注入异常（忽略）:', _e)
 
 # ---- 旋转方向 -> UISupportedInterfaceOrientations ----
 ORIENT_MAP = {
@@ -364,6 +385,7 @@ open('project.yml', 'w').write(project_yml)
 # ---- App.swift (WKWebView 加载 app.html) ----
 app_swift = '''import UIKit
 import WebKit
+import UniformTypeIdentifiers
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -377,26 +399,170 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 }
 
-class ViewController: UIViewController, WKNavigationDelegate {
+class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKDownloadDelegate {
     var webView: WKWebView!
+    var entryURL: URL!
+    var readAccessURL: URL!
+
     override func loadView() {
+        let config = Self.makeConfig(handler: self)
+        let resURL = Bundle.main.resourceURL!
+        entryURL = resURL.appendingPathComponent("__WEB_ENTRY__")
+        readAccessURL = __READ_ACCESS__
+        webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.scrollView.bounces = false
+        webView.allowsLinkPreview = false
+        view = webView
+    }
+
+    static func makeConfig(handler: WKScriptMessageHandler) -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
         config.preferences.javaScriptEnabled = true
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
         config.setValue(true, forKey: "allowUniversalAccessFromFileURLs")
-        webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = self
-        webView.scrollView.bounces = false
-        view = webView
+        if #available(iOS 14.0, *) {
+            config.defaultWebpagePreferences.allowsContentJavaScript = true
+        }
+        let uc = WKUserContentController()
+        uc.add(handler, name: "twBridge")
+        config.userContentController = uc
+        return config
     }
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        let resURL = Bundle.main.resourceURL!
-        let entryURL = resURL.appendingPathComponent("__WEB_ENTRY__")
-        // 文件夹模式：读权限给整个资源根目录，避免深层入口（如 x/y/index.html）
-        // 只能读到自己那一层、拿不到上层 web 资源。
-        webView.loadFileURL(entryURL, allowingReadAccessTo: __READ_ACCESS__)
+        webView.loadFileURL(entryURL, allowingReadAccessTo: readAccessURL)
     }
+
+    deinit {
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "twBridge")
+    }
+
+    // MARK: - bridge: web -> native
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any] else { return }
+        let type = body["type"] as? String ?? ""
+        let id = body["id"] as? String ?? ""
+        let src = message.webView
+        if type == "save" {
+            if let name = body["name"] as? String, let b64 = body["data"] as? String {
+                saveFile(name: name, base64: b64)
+                complete(webView: src, id: id, result: true)
+            } else {
+                complete(webView: src, id: id, error: "save: 参数缺失")
+            }
+        } else if type == "open" {
+            pickFile { (name, data, mime) in
+                guard let name = name, let data = data else {
+                    self.complete(webView: src, id: id, error: "用户取消或未选择文件")
+                    return
+                }
+                let s = data.base64EncodedString()
+                self.complete(webView: src, id: id, result: ["name": name, "data": s, "mime": mime ?? "application/octet-stream"])
+            }
+        }
+    }
+
+    func complete(webView: WKWebView?, id: String, result: Any? = nil, error: String? = nil) {
+        guard !id.isEmpty, let wv = webView else { return }
+        var payload: [String: Any] = [:]
+        if let e = error { payload["error"] = e } else { payload["result"] = result ?? true }
+        guard let json = try? JSONSerialization.data(withJSONObject: payload),
+              let s = String(data: json, encoding: .utf8) else { return }
+        let js = "window.__twComplete('" + id + "', " + s + ")"
+        wv.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    // MARK: - present 辅助（兼容 iPad 弹窗锚点）
+    func presentVC(_ vc: UIViewController) {
+        guard let window = UIApplication.shared.windows.first else { return }
+        var presenter = window.rootViewController
+        while let p = presenter?.presentedViewController { presenter = p }
+        if let pop = vc.popoverPresentationController {
+            pop.sourceView = presenter?.view ?? window
+            pop.sourceRect = (presenter?.view ?? window).bounds
+        }
+        presenter?.present(vc, animated: true)
+    }
+
+    func saveFile(name: String, base64: String) {
+        guard let data = Data(base64Encoded: base64) else { return }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try? data.write(to: tmp)
+        DispatchQueue.main.async { self.presentVC(UIActivityViewController(activityItems: [tmp], applicationActivities: nil)) }
+    }
+
+    func pickFile(completion: @escaping (String?, Data?, String?) -> Void) {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.data, UTType.item])
+        picker.allowsMultipleSelection = false
+        picker.delegate = DocumentPickerProxy(completion: completion)
+        DispatchQueue.main.async { self.presentVC(picker) }
+    }
+
+    // MARK: - 新窗口（文件-新窗口 / 外部链接）
+    func webView(_ webView: WKWebView, createWebViewWithConfiguration configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        let newConfig = Self.makeConfig(handler: self)
+        let newWebView = WKWebView(frame: .zero, configuration: newConfig)
+        newWebView.navigationDelegate = self
+        newWebView.uiDelegate = self
+        newWebView.scrollView.bounces = false
+        let vc = UIViewController()
+        vc.view = newWebView
+        DispatchQueue.main.async { self.presentVC(vc) }
+        return newWebView
+    }
+
+    // MARK: - JS 原生对话框（alert / confirm / prompt）
+    // WKWebView 默认不弹这些框；不实现代理方法时 confirm 会直接返回 false，
+    // 导致 TurboWarp 加载扩展时的「与 Scratch 不兼容，是否继续」确认框在 iPad 上
+    // 既不显示、扩展也永远加载不了。这里用系统弹窗呈现，并正确回调 completionHandler。
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        let ac = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        ac.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler() })
+        DispatchQueue.main.async { self.presentVC(ac) }
+    }
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        let ac = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        ac.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(false) })
+        ac.addAction(UIAlertAction(title: "Continue", style: .default) { _ in completionHandler(true) })
+        DispatchQueue.main.async { self.presentVC(ac) }
+    }
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
+        let ac = UIAlertController(title: nil, message: prompt, preferredStyle: .alert)
+        ac.addTextField { $0.text = defaultText }
+        ac.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(nil) })
+        ac.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+            completionHandler(ac.textFields?.first?.text ?? defaultText)
+        })
+        DispatchQueue.main.async { self.presentVC(ac) }
+    }
+
+    // MARK: - 下载兜底（<a download>）
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(suggestedFilename)
+        completionHandler(tmp)
+    }
+    func downloadDidFinish(_ download: WKDownload) {
+        if let url = download.originalRequest?.url {
+            DispatchQueue.main.async { self.presentVC(UIActivityViewController(activityItems: [url], applicationActivities: nil)) }
+        }
+    }
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {}
+}
+
+class DocumentPickerProxy: NSObject, UIDocumentPickerDelegate {
+    let completion: (String?, Data?, String?) -> Void
+    init(completion: @escaping (String?, Data?, String?) -> Void) { self.completion = completion }
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        guard let url = urls.first else { completion(nil, nil, nil); return }
+        let name = url.lastPathComponent
+        let mime = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier ?? "application/octet-stream"
+        if let data = try? Data(contentsOf: url) { completion(name, data, mime) }
+        else { completion(nil, nil, nil) }
+    }
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { completion(nil, nil, nil) }
 }
 '''
 if SOURCE_MODE == 'folder':
@@ -418,8 +584,13 @@ contents = {'images': [], 'info': {'author': 'xcode', 'version': 1}}
 if os.path.exists('icon.png'):
     for size, name in specs:
         out = 'Assets.xcassets/AppIcon.appiconset/%s.png' % name
-        subprocess.run(['sips', '-z', str(size), str(size), 'icon.png',
-                        '--out', out], check=False)
+        try:
+            subprocess.run(['sips', '-z', str(size), str(size), 'icon.png',
+                            '--out', out], check=False)
+        except (FileNotFoundError, OSError):
+            # sips 仅存在于 macOS；非 macOS 开发/测试环境跳过图标缩放，
+            # 真实云端（macos runner）仍会正常缩放生成各尺寸图标。
+            pass
         contents['images'].append({'idiom': 'universal', 'size': '%dx%d' % (size, size),
                                    'scale': '1x', 'filename': '%s.png' % name})
 else:
@@ -787,6 +958,120 @@ print('android icons done')
 """
 
 
+# ---------------------------------------------------------------------------
+# Web 层原生桥接 polyfill（注入到入口 HTML 的 <head>，在 index.js 之前执行）。
+# 让 WKWebView 里缺失的 File System Access API / 文件选择 / 插件加载 转到原生。
+# 注入逻辑见 IOS_MAKER；本常量作为 tw_bridge.js 推到云端仓库，运行时被读取。
+# ---------------------------------------------------------------------------
+TW_BRIDGE_JS = r'''(function(){
+  if (window.__tw_bridge_v1) return;
+  window.__tw_bridge_v1 = true;
+  var _pending = {};
+  var _seq = 1;
+  function _post(type, extra) {
+    return new Promise(function(resolve, reject){
+      var id = 'r' + (_seq++);
+      _pending[id] = {resolve: resolve, reject: reject};
+      try {
+        window.webkit.messageHandlers.twBridge.postMessage(Object.assign({id:id, type:type}, extra||{}));
+      } catch(e){ delete _pending[id]; reject(e); }
+    });
+  }
+  window.__twComplete = function(id, payload){
+    var p = _pending[id]; if(!p) return; delete _pending[id];
+    if(payload && payload.error) p.reject(new Error(payload.error)); else p.resolve(payload?payload.result:true);
+  };
+  function blobToB64(blob){
+    return new Promise(function(res,rej){
+      var fr=new FileReader();
+      fr.onload=function(){ res(fr.result.split(',')[1]); };
+      fr.onerror=rej; fr.readAsDataURL(blob);
+    });
+  }
+  // ---- showSaveFilePicker：骗过 TurboWarp 的禁用判断 ----
+  if (typeof window.showSaveFilePicker !== 'function') {
+    window.showSaveFilePicker = function(opts){
+      var suggestedName = (opts && opts.suggestedName) || 'untitled';
+      var fakeHandle = {
+        name: suggestedName,
+        createWritable: function(){
+          return {
+            write: function(data){
+              var blob = (data instanceof Blob) ? data : new Blob([data]);
+              return blobToB64(blob).then(function(b64){
+                return _post('save', {name: suggestedName, data: b64, mime: blob.type||'application/octet-stream'});
+              });
+            },
+            close: function(){ return Promise.resolve(); }
+          };
+        }
+      };
+      return Promise.resolve(fakeHandle);
+    };
+  }
+  // ---- showOpenFilePicker ----
+  if (typeof window.showOpenFilePicker !== 'function') {
+    window.showOpenFilePicker = function(opts){
+      return _post('open', {}).then(function(res){
+        var bytes = atob(res.data);
+        var arr = new Uint8Array(bytes.length);
+        for (var i=0;i<bytes.length;i++) arr[i]=bytes.charCodeAt(i);
+        var blob = new Blob([arr], {type: res.mime||'application/octet-stream'});
+        var fakeFile = {
+          name: res.name, size: arr.length, type: res.mime||'application/octet-stream',
+          arrayBuffer: function(){ return Promise.resolve(arr.buffer.slice(0)); },
+          text: function(){ return Promise.resolve(bytes); },
+          getFile: function(){ return Promise.resolve(this); }
+        };
+        return [ { getFile: function(){ return Promise.resolve(fakeFile); }, name: res.name } ];
+      });
+    };
+  }
+  // ---- 插件加载：JS 或 JSON（兼容）----
+  window.twLoadPlugin = function(text){
+    return new Promise(function(resolve, reject){
+      try {
+        var code = text;
+        try {
+          var j = JSON.parse(text);
+          if (j && typeof j === 'object') {
+            if (typeof j.code === 'string') code = j.code;
+            else if (typeof j.extension === 'string') code = j.extension;
+            else if (typeof j.source === 'string') code = j.source;
+          }
+        } catch(e){}
+        var vm = findVM();
+        if (!vm || !vm.extensionManager) { reject(new Error('找不到 TurboWarp 运行时(vm.extensionManager)')); return; }
+        var blobUrl = URL.createObjectURL(new Blob([code], {type:'text/javascript'}));
+        Promise.resolve(vm.extensionManager.loadExtensionURL(blobUrl)).then(function(){ resolve(true); }).catch(reject);
+      } catch(e){ reject(e); }
+    });
+  };
+  function findVM(){
+    var roots = [document.getElementById('app'), document.querySelector('#root')];
+    for (var ri=0; ri<roots.length; ri++){
+      var r = roots[ri]; if(!r) continue;
+      for (var k in r){
+        if (k.indexOf('__reactContainer$')===0 || k.indexOf('__reactInternalInstance$')===0){
+          var fiber = r[k]; if (fiber && fiber.current) fiber = fiber.current;
+          var found = walkFiber(fiber); if (found) return found;
+        }
+      }
+    }
+    return null;
+  }
+  function walkFiber(fiber){
+    if (!fiber) return null;
+    var sn = fiber.stateNode;
+    if (sn && sn.props && sn.props.vm && sn.props.vm.extensionManager) return sn.props.vm;
+    if (fiber.memoizedProps && fiber.memoizedProps.vm && fiber.memoizedProps.vm.extensionManager) return fiber.memoizedProps.vm;
+    var c = walkFiber(fiber.child); if (c) return c;
+    return walkFiber(fiber.sibling);
+  }
+  console.log('[tw_bridge] injected v1 (save/open/plugin)');
+})();
+'''
+
 def get_workflow(platform: str) -> str:
     return IOS_WORKFLOW if platform == 'ios' else ANDROID_WORKFLOW
 
@@ -794,5 +1079,5 @@ def get_workflow(platform: str) -> str:
 def get_maker_files(platform: str) -> dict:
     """返回需要随仓库推送的「生成脚本」文件名 -> 内容（文本）。"""
     if platform == 'ios':
-        return {'make_project.py': IOS_MAKER}
+        return {'make_project.py': IOS_MAKER, 'tw_bridge.js': TW_BRIDGE_JS}
     return {'make_project.py': ANDROID_MAKER, 'make_icons.py': ANDROID_ICONS}
