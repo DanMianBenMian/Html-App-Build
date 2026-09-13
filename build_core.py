@@ -105,21 +105,45 @@ def sanitize_bundle_id(bundle_id: str, app_name: str) -> str:
     return "com.twpack.%s" % (_ascii_slug(app_name) or "app")
 
 
-def _zip_folder(folder: str) -> bytes:
-    """把整个文件夹打成 zip（内存中），相对路径用正斜杠，保持目录结构。"""
+def _zip_folder(folder: str, entry_html=None, bridge_js=None):
+    """把整个文件夹打成 zip（内存中），相对路径用正斜杠，保持目录结构。
+
+    entry_html / bridge_js 给出时，在「打包这一步」就把 tw_bridge 注入入口 HTML
+    （本地完成、可本地验证），不再依赖云端 make_project.py 的二次注入。
+    返回 (zip_bytes, 文件数, 是否注入了 bridge)。
+    """
     import zipfile
-    import io
-    buf = io.BytesIO()
+    import io as _io
+    import templates
+    buf = _io.BytesIO()
     n = 0
+    injected = False
+    entry_rel = entry_html.replace(os.sep, "/") if entry_html else None
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for root, _dirs, files in os.walk(folder):
             for fn in files:
                 fp = os.path.join(root, fn)
                 rel = os.path.relpath(fp, folder).replace(os.sep, "/")
+                if entry_rel and bridge_js and rel == entry_rel:
+                    with open(fp, "rb") as f:
+                        raw = f.read()
+                    try:
+                        txt = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        z.writestr(rel, raw)          # 非 UTF-8 入口不动
+                    else:
+                        new = templates.inject_bridge_into_html(txt, bridge_js)
+                        if new != txt:
+                            z.writestr(rel, new.encode("utf-8"))
+                            injected = True
+                        else:
+                            z.writestr(rel, raw)
+                    n += 1
+                    continue
                 # 跳过可能混进来的隐藏/缓存文件（不做硬过滤，保留用户资源）
                 z.write(fp, rel)
                 n += 1
-    return buf.getvalue(), n
+    return buf.getvalue(), n, injected
 
 
 def build(platform, html_path, icon_path, name, bundle_id, perms,
@@ -234,7 +258,12 @@ def build(platform, html_path, icon_path, name, bundle_id, perms,
         _log("  · config.json 已推送")
         # app.html（单文件模式）或 app.zip（文件夹模式）
         if source_mode == "folder":
-            zip_bytes, zip_count = _zip_folder(folder_path)
+            zip_bytes, zip_count, _inj = _zip_folder(
+                folder_path, entry_html, templates.TW_BRIDGE_JS)
+            if _inj:
+                _log("  · 已本地注入 tw_bridge -> %s（云端无需再注入）" % entry_html)
+            else:
+                _log("  · 提示: tw_bridge 未注入（入口 %s 不存在或已含标记）" % entry_html)
             gh_api.push_file(token, owner, repo, "app.zip", zip_bytes, "add app.zip")
             _log("  · app.zip 已推送 (%.1f KB, %d 个文件)" % (len(zip_bytes) / 1024.0, zip_count))
         else:
@@ -256,9 +285,17 @@ def build(platform, html_path, icon_path, name, bundle_id, perms,
                          templates.get_workflow(platform).encode("utf-8"), "add workflow")
         makers = templates.get_maker_files(platform)
         for fn, content in makers.items():
-            gh_api.push_file(token, owner, repo, fn, content.encode("utf-8"), "add %s" % fn)
+            try:
+                _res = gh_api.push_file(token, owner, repo, fn,
+                                        content.encode("utf-8"), "add %s" % fn)
+                _sha = ""
+                if isinstance(_res, dict):
+                    _sha = (((_res.get("content") or {}).get("sha")) or "")[:7]
+                _log("  · %s 已推送%s" % (fn, (" (sha=%s)" % _sha) if _sha else ""))
+            except Exception as _e:
+                # 推送失败必须显式暴露：否则云端会静默跳过注入等步骤
+                _log("  · ⚠ %s 推送失败: %s" % (fn, _e))
         _log("  · 工作流 %s 已推送" % wf_name)
-        _log("  · 生成脚本已推送: %s" % ", ".join(makers.keys()))
         _log("✓ 全部工程文件已提交至仓库")
 
         _step(3, "触发 %s 云端构建" % platform.upper())
