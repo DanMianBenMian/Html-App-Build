@@ -140,19 +140,35 @@ else:
     print('单文件模式：app.html')
 
 # ---- 注入原生桥接 polyfill（让保存/打开/新窗口/插件在 WKWebView 可用）----
+# 注入位置很关键：插在 </head> 之前，而不是紧跟 <head>。
+# 原因：bridge 有 4KB+，紧跟 <head> 会把 <meta charset> 挤出浏览器 1024 字节
+# 预扫描窗口 -> 整页（含 index.js）按错误编码解析 -> 中文乱码/脚本异常。
+# 插在 </head> 之前：charset 仍在文件最前，且 bridge 依然早于 <script src="index.js">。
 try:
     _bridge_path = 'tw_bridge.js'
     if os.path.exists(_bridge_path) and os.path.exists(_web_entry):
         _bjs = io.open(_bridge_path, encoding='utf-8').read()
         _html = io.open(_web_entry, encoding='utf-8', errors='replace').read()
         if 'tw_bridge_v1' not in _html:
-            _m = re.search(r'<head[^>]*>', _html, re.IGNORECASE)
-            if _m:
-                _html = _html[:_m.end()] + '\n' + _bjs + _html[_m.end():]
-                io.open(_web_entry, 'w', encoding='utf-8').write(_html)
-                print('已注入 tw_bridge 到', _web_entry)
+            _wrapped = '\n<!-- tw_bridge native polyfill -->\n<script>\n' + _bjs + '\n</script>\n'
+            _m_end = re.search(r'</head\s*>', _html, re.IGNORECASE)
+            _pos = None
+            if _m_end:
+                _pos = _m_end.start()
             else:
-                print('WARNING: 入口 HTML 无 <head>，未注入 bridge')
+                _m_head = re.search(r'<head[^>]*>', _html, re.IGNORECASE)
+                if _m_head:
+                    _pos = _m_head.end()
+            if _pos is not None:
+                _html = _html[:_pos] + _wrapped + _html[_pos:]
+                # 自检：charset 声明必须仍在浏览器 1024 字节预扫描窗口内
+                _probe = _html[:1024].lower()
+                if 'charset' not in _probe:
+                    print('WARNING: <meta charset> 不在前 1024 字节内，可能出现编码异常')
+                io.open(_web_entry, 'w', encoding='utf-8').write(_html)
+                print('已注入 tw_bridge 到', _web_entry, '(@', _pos, ')')
+            else:
+                print('WARNING: 入口 HTML 无 <head>/</head>，未注入 bridge')
         else:
             print('bridge 已存在，跳过注入')
     else:
@@ -383,7 +399,7 @@ __APP_SOURCE_BLOCK__
 open('project.yml', 'w').write(project_yml)
 
 # ---- App.swift (WKWebView 加载 app.html) ----
-app_swift = '''import UIKit
+app_swift = r'''import UIKit
 import WebKit
 import UniformTypeIdentifiers
 
@@ -427,6 +443,8 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKSc
         }
         let uc = WKUserContentController()
         uc.add(handler, name: "twBridge")
+        let errJS = "(function(){function post(m){try{window.webkit.messageHandlers.twBridge.postMessage({type:'err',msg:String(m)});}catch(e){}}window.onerror=function(msg,src,line,col){post('JSERR: '+msg+' @'+(src||'')+':'+line+':'+col);return false;};window.addEventListener('unhandledrejection',function(ev){var r=ev.reason;post('PROMISE: '+(r&&r.message?r.message:(r||'')));});})();"
+        uc.addUserScript(WKUserScript(source: errJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         config.userContentController = uc
         return config
     }
@@ -462,6 +480,8 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKSc
                 let s = data.base64EncodedString()
                 self.complete(webView: src, id: id, result: ["name": name, "data": s, "mime": mime ?? "application/octet-stream"])
             }
+        } else if type == "err" {
+            if let m = body["msg"] as? String { showError(m) }
         }
     }
 
@@ -485,6 +505,30 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKSc
             pop.sourceRect = (presenter?.view ?? window).bounds
         }
         presenter?.present(vc, animated: true)
+    }
+
+    func showError(_ msg: String) {
+        DispatchQueue.main.async {
+            if let lb = self.view.viewWithTag(9911) as? UILabel {
+                lb.text = msg
+                return
+            }
+            let lb = UILabel()
+            lb.tag = 9911
+            lb.numberOfLines = 0
+            lb.lineBreakMode = .byCharWrapping
+            lb.backgroundColor = UIColor.red.withAlphaComponent(0.92)
+            lb.textColor = .white
+            lb.font = UIFont.systemFont(ofSize: 13)
+            lb.text = "加载错误:\n" + msg
+            lb.textAlignment = .left
+            lb.layer.cornerRadius = 6
+            lb.clipsToBounds = true
+            let w = self.view.bounds.width - 16
+            lb.frame = CGRect(x: 8, y: 30, width: w, height: 140)
+            lb.autoresizingMask = [.flexibleWidth]
+            self.view.addSubview(lb)
+        }
     }
 
     func saveFile(name: String, base64: String) {
@@ -512,6 +556,14 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKSc
         vc.view = newWebView
         DispatchQueue.main.async { self.presentVC(vc) }
         return newWebView
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        showError("导航失败(provisional): " + error.localizedDescription)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        showError("加载失败: " + error.localizedDescription)
     }
 
     // MARK: - JS 原生对话框（alert / confirm / prompt）
@@ -1074,6 +1126,31 @@ TW_BRIDGE_JS = r'''(function(){
 
 def get_workflow(platform: str) -> str:
     return IOS_WORKFLOW if platform == 'ios' else ANDROID_WORKFLOW
+
+
+def inject_bridge_into_html(html_text: str, bridge_js: str) -> str:
+    """把 tw_bridge polyfill 以 <script> 形式插到 </head> 之前（原样返回表示未改动）。
+
+    两个踩过的坑（务必保持）：
+      1) 必须用 <script> 包裹：桥接 JS 里有 `<`（如 i<len），裸插会被 HTML 解析器
+         当成标签起始，吞掉 <meta charset> 并破坏 head 结构。
+      2) 必须插在 </head> 之前，而不是紧跟 <head>：桥接有 4KB+，紧跟 <head> 会把
+         <meta charset> 挤出浏览器 1024 字节预扫描窗口，导致整页（含 index.js）
+         按错误编码解析。
+    """
+    import re as _re
+    if not bridge_js or 'tw_bridge_v1' in html_text:
+        return html_text
+    _wrapped = '\n<!-- tw_bridge native polyfill -->\n<script>\n' + bridge_js + '\n</script>\n'
+    _m = _re.search(r'</head\s*>', html_text, _re.IGNORECASE)
+    if _m:
+        _pos = _m.start()
+    else:
+        _m2 = _re.search(r'<head[^>]*>', html_text, _re.IGNORECASE)
+        if not _m2:
+            return html_text
+        _pos = _m2.end()
+    return html_text[:_pos] + _wrapped + html_text[_pos:]
 
 
 def get_maker_files(platform: str) -> dict:
