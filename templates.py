@@ -121,6 +121,24 @@ BUNDLE_ID = cfg.get('bundle_id', 'com.twpack.app')
 PERMS = cfg.get('permissions', [])
 ORIENT = cfg.get('orientation', 'auto')          # portrait | landscape | auto
 
+# ---- 来源模式：单文件 app.html 或 文件夹 app.zip ----
+SOURCE_MODE = cfg.get('source_mode', 'file')      # 'file' | 'folder'
+ENTRY_HTML = cfg.get('entry_html') or 'index.html'
+import zipfile as _zf
+if SOURCE_MODE == 'folder':
+    if os.path.exists('app.zip'):
+        _zf.ZipFile('app.zip').extractall('app')
+        print('已解压 app.zip -> app/')
+    _web_entry = 'app/%s' % ENTRY_HTML
+    if not os.path.exists(_web_entry):
+        raise SystemExit('ERROR: 入口文件缺失 %s' % _web_entry)
+    print('文件夹模式：入口 =', _web_entry)
+else:
+    if not os.path.exists('app.html'):
+        raise SystemExit('ERROR: 仓库里找不到 app.html，无法打包')
+    _web_entry = 'app.html'
+    print('单文件模式：app.html')
+
 # ---- 旋转方向 -> UISupportedInterfaceOrientations ----
 ORIENT_MAP = {
     'portrait':  ['UIInterfaceOrientationPortrait'],
@@ -299,6 +317,20 @@ open('App.entitlements', 'w').write('''<?xml version="1.0" encoding="UTF-8"?>
 ''')
 
 # ---- project.yml (XcodeGen) ----
+# ⚠️ 文件夹模式必须用 folder reference（type: folder）整体拷贝目录。
+#    绝不能用默认的 group：group 会把目录里所有文件逐个塞进 Resources 阶段并
+#    **扁平铺到 bundle 根目录**，于是：
+#      1) 不同子目录下的同名文件（如 blocks-media/default/zoom-in.svg 与
+#         high-contrast/zoom-in.svg）会被两条 CpResource 命令抢同一个输出名，
+#         直接报 `error: Multiple commands produce '...app/zoom-in.svg'` —— 构建失败；
+#      2) 即便不重名，相对目录结构也被抹平，网页里的 static/... 相对路径全部失效。
+if SOURCE_MODE == 'folder':
+    app_source_block = ('      - path: app\n'
+                        '        buildPhase: resources\n'
+                        '        type: folder')
+else:
+    app_source_block = ('      - path: app.html\n'
+                        '        buildPhase: resources')
 project_yml = '''name: App
 options:
   bundleIdPrefix: com.twpack
@@ -310,8 +342,7 @@ targets:
     platform: iOS
     sources:
       - path: App.swift
-      - path: app.html
-        buildPhase: resources
+__APP_SOURCE_BLOCK__
       - path: icon.png
         buildPhase: resources
       - path: Assets.xcassets
@@ -326,7 +357,8 @@ targets:
         INFOPLIST_FILE: Info.plist
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: App.entitlements
-'''.replace('__BUNDLE_ID__', BUNDLE_ID).replace('__BUNDLE_NAME__', BUNDLE_NAME)
+'''.replace('__BUNDLE_ID__', BUNDLE_ID).replace('__BUNDLE_NAME__', BUNDLE_NAME) \
+  .replace('__APP_SOURCE_BLOCK__', app_source_block)
 open('project.yml', 'w').write(project_yml)
 
 # ---- App.swift (WKWebView 加载 app.html) ----
@@ -359,13 +391,20 @@ class ViewController: UIViewController, WKNavigationDelegate {
     }
     override func viewDidLoad() {
         super.viewDidLoad()
-        if let url = Bundle.main.url(forResource: "app", withExtension: "html") {
-            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
-        }
+        let resURL = Bundle.main.resourceURL!
+        let entryURL = resURL.appendingPathComponent("__WEB_ENTRY__")
+        // 文件夹模式：读权限给整个资源根目录，避免深层入口（如 x/y/index.html）
+        // 只能读到自己那一层、拿不到上层 web 资源。
+        webView.loadFileURL(entryURL, allowingReadAccessTo: __READ_ACCESS__)
     }
 }
 '''
-open('App.swift', 'w').write(app_swift)
+if SOURCE_MODE == 'folder':
+    read_access = 'resURL.appendingPathComponent("app")'
+else:
+    read_access = 'entryURL.deletingLastPathComponent()'
+open('App.swift', 'w').write(
+    app_swift.replace('__WEB_ENTRY__', _web_entry).replace('__READ_ACCESS__', read_access))
 
 # ---- 图标资源目录（sips resize 成各尺寸）----
 os.makedirs('Assets.xcassets/AppIcon.appiconset', exist_ok=True)
@@ -470,6 +509,23 @@ BUNDLE_ID = cfg.get('bundle_id', 'com.twpack.app')
 PERMS = cfg.get('permissions', [])
 ORIENT = cfg.get('orientation', 'auto')          # portrait | landscape | auto
 
+# ---- 来源模式：单文件 app.html 或 文件夹 app.zip ----
+SOURCE_MODE = cfg.get('source_mode', 'file')
+ENTRY_HTML = cfg.get('entry_html') or 'index.html'
+import zipfile as _zf
+if SOURCE_MODE == 'folder':
+    if os.path.exists('app.zip'):
+        _zf.ZipFile('app.zip').extractall('web')
+        print('已解压 app.zip -> web/')
+    _entry_src = os.path.join('web', ENTRY_HTML)
+    if not os.path.exists(_entry_src):
+        raise SystemExit('ERROR: 入口文件缺失 web/%s' % ENTRY_HTML)
+    print('文件夹模式：入口 =', _entry_src)
+else:
+    if not os.path.exists('app.html'):
+        raise SystemExit('ERROR: 仓库里找不到 app.html，无法打包')
+    print('单文件模式：app.html')
+
 # ---- 旋转方向 -> android:screenOrientation ----
 # auto 用 fullSensor：跟随重力传感器（忽略系统旋转锁），行为最可预期；
 # 若想"尊重系统旋转锁"，把它改成 unspecified。
@@ -534,13 +590,28 @@ os.makedirs('app/src/main/res/layout', exist_ok=True)
 os.makedirs('app/src/main/assets', exist_ok=True)
 
 # ---- 把 TurboWarp 产物放进 assets ----
-# ★ 必须复制：MainActivity 加载的是 file:///android_asset/app.html，
-#   少了这一步 APK 里就没有 app.html → 打开即白屏（且构建不会报任何错）。
+# ★ 必须复制：MainActivity 加载的是 file:///android_asset/...，
+#   少了这一步 APK 里就没有对应文件 → 打开即白屏（且构建不会报任何错）。
 import shutil as _shutil
-if not os.path.exists('app.html'):
-    raise SystemExit('ERROR: 仓库里找不到 app.html，无法打包')
-_shutil.copy('app.html', 'app/src/main/assets/app.html')
-print('assets/app.html =', os.path.getsize('app/src/main/assets/app.html'), 'bytes')
+if SOURCE_MODE == 'folder':
+    # 整个 app/ 目录拷贝进 assets/www/，入口为 www/<ENTRY_HTML>
+    WWW = 'app/src/main/assets/www'
+    os.makedirs(WWW, exist_ok=True)
+    for _item in os.listdir('web'):
+        _s = os.path.join('web', _item)
+        _d = os.path.join(WWW, _item)
+        if os.path.isdir(_s):
+            _shutil.copytree(_s, _d, dirs_exist_ok=True)
+        else:
+            _shutil.copy(_s, _d)
+    _web_url = 'file:///android_asset/www/%s' % ENTRY_HTML
+    print('assets/www/%s (文件夹模式)' % ENTRY_HTML)
+else:
+    if not os.path.exists('app.html'):
+        raise SystemExit('ERROR: 仓库里找不到 app.html，无法打包')
+    _shutil.copy('app.html', 'app/src/main/assets/app.html')
+    _web_url = 'file:///android_asset/app.html'
+    print('assets/app.html =', os.path.getsize('app/src/main/assets/app.html'), 'bytes')
 
 # ---- 权限映射 ----
 PERMISSION_DEFS = {
@@ -636,7 +707,7 @@ public class MainActivity extends Activity {
         s.setMediaPlaybackRequiresUserGesture(false);
         webView.setWebViewClient(new WebViewClient());
         setContentView(webView);
-        webView.loadUrl("file:///android_asset/app.html");
+        webView.loadUrl("__WEB_URL__");
     }
     @Override
     public void onBackPressed() {
@@ -644,7 +715,7 @@ public class MainActivity extends Activity {
         else super.onBackPressed();
     }
 }
-'''.replace('__PKG__', PKG)
+'''.replace('__PKG__', PKG).replace('__WEB_URL__', _web_url)
 open('app/src/main/java/%s/MainActivity.java' % PKG_PATH, 'w').write(main_activity)
 
 # res
